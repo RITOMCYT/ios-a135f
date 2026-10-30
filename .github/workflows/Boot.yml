@@ -1,4 +1,51 @@
 
+name: Build A135F Boot Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      xnu_run_id:
+        description: "Successful XNU workflow Run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download XNU kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-development-a135f
+          path: artifacts/kernel
+          run-id: ${{ inputs.xnu_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            gcc \
+            make \
+            cpio \
+            gzip \
+            python3 \
+            python3-pip \
+            python3-venv \
+            file
+
       - name: Install AOSP boot image tools
         run: |
           git clone --depth 1 \
@@ -7,18 +54,79 @@
 
           mkdir -p "$RUNNER_TEMP/bin"
 
-          cat > "$RUNNER_TEMP/bin/mkbootimg" <<'EOF'
-          #!/bin/bash
-          exec python3 /tmp/aosp-mkbootimg/mkbootimg.py "$@"
-          EOF
+          printf '#!/bin/bash\nexec python3 /tmp/aosp-mkbootimg/mkbootimg.py "$@"\n' \
+            > "$RUNNER_TEMP/bin/mkbootimg"
 
-          cat > "$RUNNER_TEMP/bin/unpack_bootimg.py" <<'EOF'
-          #!/bin/bash
-          exec python3 /tmp/aosp-mkbootimg/unpack_bootimg.py "$@"
-          EOF
+          printf '#!/bin/bash\nexec python3 /tmp/aosp-mkbootimg/unpack_bootimg.py "$@"\n' \
+            > "$RUNNER_TEMP/bin/unpack_bootimg.py"
 
           chmod +x "$RUNNER_TEMP/bin/"*
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
           mkbootimg --help
           unpack_bootimg.py --help
+
+      - name: Prepare XNU kernel
+        run: |
+          mkdir -p xnu/out shim/out
+
+          KERNEL=$(find artifacts/kernel -type f \
+            -name 'kernel.development.a135f' | head -n 1)
+
+          if [ -z "$KERNEL" ]; then
+            echo "XNU kernel not found"
+            exit 1
+          fi
+
+          cp "$KERNEL" xnu/out/kernel.development.a135f
+          file xnu/out/kernel.development.a135f
+
+      - name: Generate ADT
+        run: |
+          python3 tools/mkadt.py shim/out/a135f.adt
+
+      - name: Generate XNU payload
+        run: |
+          python3 tools/mkpayload.py \
+            xnu/out/kernel.development.a135f \
+            shim/out/a135f.adt \
+            shim/out/payload.bin \
+            --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=mmcroot0 mmcrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 a135f_fb_noconsole=1 a135f_fb_hz=30'
+
+      - name: Build shim
+        run: |
+          chmod +x shim/build.sh
+          cd shim
+          ./build.sh out/payload.bin
+
+      - name: Verify outputs
+        run: |
+          ls -lh shim/out/
+          test -s shim/out/Image
+          test -s shim/out/ramdisk.bin
+
+          if [ ! -s shim/out/boot.img ]; then
+            echo "boot.img was not generated"
+            exit 1
+          fi
+
+          if [ ! -s shim/out/AP_a135f.tar.md5 ]; then
+            echo "Odin package was not generated"
+            exit 1
+          fi
+
+      - name: Upload A135F boot artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: A135F-XNU-BOOT
+          path: |
+            shim/out/boot.img
+            shim/out/a135f-boot.img
+            shim/out/AP_a135f.tar.md5
+            shim/out/Image
+            shim/out/ramdisk.bin
+            shim/out/payload.bin
+            shim/out/a135f.adt
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
